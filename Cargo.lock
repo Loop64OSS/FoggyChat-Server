@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "FoggyChatServer"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "base64",
- "blake3",
- "chacha20poly1305",
- "hkdf",
- "lazy_static",
- "rand",
- "regex",
- "sha2",
- "tokio",
- "uuid",
- "x25519-dalek",
-]
-
-[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,6 +133,12 @@ name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
+
+[[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -285,6 +273,25 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "foggychat-server"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "blake3",
+ "byteorder",
+ "chacha20poly1305",
+ "hkdf",
+ "lazy_static",
+ "rand",
+ "regex",
+ "sha2",
+ "tokio",
+ "uuid",
+ "x25519-dalek",
+]
 
 [[package]]
 name = "generic-array"
