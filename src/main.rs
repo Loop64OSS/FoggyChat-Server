@@ -19,6 +19,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::protocol_utils::fctp::FctpCode;
+use crate::protocol_utils::fctp::FctpMessage;
 use crate::protocol_utils::fctp::send_fctp_message;
 use crate::protocol_utils::fctp_client::ClientInfo;
 use crate::protocol_utils::fctp_client::Clients;
@@ -130,14 +132,13 @@ async fn handle_client(
                                 client_info.ext_rate_limit_burst_count = 1;
                                 true
                             } else {
-                                send_fctp_message(
-                                    client_info,
-                                    405,
+                                let id_msg = FctpMessage::new(
+                                    FctpCode::MethodNotAllowed,
                                     get_id(),
                                     "You are being rate limited, slow down! Your message has been dropped.",
                                     &id,
-                                )
-                                .await;
+                                );
+                                send_fctp_message(client_info, &id_msg).await?;
                                 false
                             }
                         } else {
@@ -251,28 +252,5 @@ mod tests {
         let id = generate_id();
         assert!(!id.is_nil(), "Generated ID should not be nil");
         println!("Generated ID: {}", id);
-    }
-
-    #[test]
-    fn test_binary_fctp_roundtrip() {
-        let key = symmetric::keygen();
-        let code = 200;
-        let from = "test_user";
-        let body = "Test message with binary encryption";
-        let to = "recipient";
-
-        let encrypted_msg = fctp::encapsulate_to_fctp(code, from, body, to, key);
-        assert!(
-            !encrypted_msg.is_empty(),
-            "Encrypted message should not be empty"
-        );
-
-        let decoded = fctp::decapsulate_fctp_message(&encrypted_msg, key)
-            .expect("Should decode successfully");
-
-        assert_eq!(decoded.code, code);
-        assert_eq!(decoded.from, from);
-        assert_eq!(decoded.body, body);
-        assert_eq!(decoded.to, to);
     }
 }

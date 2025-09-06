@@ -1,285 +1,405 @@
 use aes_gcm::{Aes256Gcm, Key};
+use std::time::Duration;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use x25519_dalek::PublicKey;
 
 use crate::{
     crypt::{self, symmetric},
     get_id,
-    protocol_utils::{fctp_client, fctp_operations::kick_client},
+    protocol_utils::fctp_client,
 };
+//Internal errors
+#[derive(Error, Debug)]
+pub enum FctpError {
+    #[error("Encryption failed: {0}")]
+    EncryptionFailed(String),
+    #[error("Decryption failed: {0}")]
+    DecryptionFailed(String),
+    #[error("Malformed message: {0}")]
+    MalformedMessage(String),
+    #[error("Invalid protocol version: {0}")]
+    InvalidProtocolVersion(String),
+    #[error("Network error: {0}")]
+    NetworkError(String),
+    #[error("Client not found: {0}")]
+    ClientNotFound(String),
+    #[error("Invalid nickname: {0}")]
+    InvalidNickname(String),
+}
+//Statics
+type Result<T> = std::result::Result<T, FctpError>;
 
+const PROTOCOL_VERSION: &str = "FoggyChat Transfer Protocol 0.1";
+const MIN_NICK_LENGTH: usize = 3;
+const MAX_NICK_LENGTH: usize = 20;
+// Protocol codes
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FctpCode {
+    Ping = 10,
+    Pong = 11,
+    Message = 200,
+    Command = 201,
+    BadRequest = 400,
+    MethodNotAllowed = 405,
+    InternalServerError = 500,
+    ServiceUnavailable = 505,
+    Hello = 900,
+    PublicKeyExchange = 901,
+    KeyRequest = 902,
+}
+
+impl FctpCode {
+    fn from_i32(code: i32) -> Option<Self> {
+        match code {
+            10 => Some(Self::Ping),
+            11 => Some(Self::Pong),
+            200 => Some(Self::Message),
+            201 => Some(Self::Command),
+            400 => Some(Self::BadRequest),
+            405 => Some(Self::MethodNotAllowed),
+            500 => Some(Self::InternalServerError),
+            505 => Some(Self::ServiceUnavailable),
+            900 => Some(Self::Hello),
+            901 => Some(Self::PublicKeyExchange),
+            902 => Some(Self::KeyRequest),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct FctpMessage {
-    pub code: i32,
+    pub code: FctpCode,
     pub from: String,
     pub body: String,
     pub to: String,
 }
 
-/*
-    FCTP message processing with binary encryption
-*/
-pub fn encapsulate_to_fctp(
-    code: i32,
-    from: &str,
-    body: &str,
-    to: &str,
-    session_key: Key<Aes256Gcm>,
-) -> Vec<u8> {
-    let message = format!(
-        "FoggyChat Transfer Protocol 0.1\r\n{}\r\nFrom: {}\r\nBody: {}\r\nTo: {}\r\n\r\n",
-        code, from, body, to
-    );
-
-    match symmetric::encrypt_binary(&message, &session_key) {
-        Ok(encrypted) => encrypted,
-        Err(e) => {
-            eprintln!("Encryption failed: {:?}", e);
-            Vec::new()
+impl FctpMessage {
+    pub fn new(
+        code: FctpCode,
+        from: impl Into<String>,
+        body: impl Into<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            from: from.into(),
+            body: body.into(),
+            to: to.into(),
         }
     }
-}
 
-pub fn decapsulate_fctp_message(msg: &[u8], session_key: Key<Aes256Gcm>) -> Option<FctpMessage> {
-    if session_key == Key::<Aes256Gcm>::default() {
-        let decrypted_str = String::from_utf8(msg.to_vec()).ok()?;
-        return parse_fctp_message(&decrypted_str);
+    pub fn ping(to: impl Into<String>) -> Self {
+        Self::new(FctpCode::Ping, get_id(), "ping", to)
     }
 
-    let decrypted_bytes = symmetric::decrypt_binary(msg, &session_key).ok()?;
-    let decrypted_str = String::from_utf8(decrypted_bytes).ok()?;
+    pub fn pong(to: impl Into<String>) -> Self {
+        Self::new(FctpCode::Pong, get_id(), "pong", to)
+    }
+
+    pub fn error(code: FctpCode, message: impl Into<String>, to: impl Into<String>) -> Self {
+        Self::new(code, get_id(), message, to)
+    }
+}
+// Header tools
+pub fn encapsulate_to_fctp(message: &FctpMessage, session_key: &Key<Aes256Gcm>) -> Result<Vec<u8>> {
+    let formatted_message = format!(
+        "{}\r\n{}\r\nFrom: {}\r\nBody: {}\r\nTo: {}\r\n\r\n",
+        PROTOCOL_VERSION, message.code as i32, message.from, message.body, message.to
+    );
+
+    symmetric::encrypt_binary(&formatted_message, session_key)
+        .map_err(|e| FctpError::EncryptionFailed(format!("{:?}", e)))
+}
+
+pub fn decapsulate_fctp_message(msg: &[u8], session_key: &Key<Aes256Gcm>) -> Result<FctpMessage> {
+    let decrypted_str = if *session_key == Key::<Aes256Gcm>::default() {
+        // Unencrypted message!
+        String::from_utf8(msg.to_vec())
+            .map_err(|e| FctpError::DecryptionFailed(format!("UTF-8 decode error: {}", e)))?
+    } else {
+        let decrypted_bytes = symmetric::decrypt_binary(msg, session_key)
+            .map_err(|e| FctpError::DecryptionFailed(format!("{:?}", e)))?;
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| FctpError::DecryptionFailed(format!("UTF-8 decode error: {}", e)))?
+    };
 
     parse_fctp_message(&decrypted_str)
 }
 
-fn parse_fctp_message(message: &str) -> Option<FctpMessage> {
+fn parse_fctp_message(message: &str) -> Result<FctpMessage> {
     let mut lines = message.lines();
 
-    if lines.next()? != "FoggyChat Transfer Protocol 0.1" {
-        return None;
+    // Check protocol
+    let protocol_line = lines
+        .next()
+        .ok_or_else(|| FctpError::MalformedMessage("Missing protocol line".to_string()))?;
+
+    if protocol_line != PROTOCOL_VERSION {
+        return Err(FctpError::InvalidProtocolVersion(protocol_line.to_string()));
     }
 
-    let code = lines.next()?.trim().parse::<i32>().ok()?;
-    let from = lines.next()?.strip_prefix("From: ")?.trim().to_string();
-    let body = lines.next()?.strip_prefix("Body: ")?.trim().to_string();
-    let to = lines.next()?.strip_prefix("To: ")?.trim().to_string();
+    // parse status code
+    let code_str = lines
+        .next()
+        .ok_or_else(|| FctpError::MalformedMessage("Missing code line".to_string()))?
+        .trim();
 
-    Some(FctpMessage {
+    let code_int = code_str
+        .parse::<i32>()
+        .map_err(|_| FctpError::MalformedMessage(format!("Invalid code: {}", code_str)))?;
+
+    let code = FctpCode::from_i32(code_int)
+        .ok_or_else(|| FctpError::MalformedMessage(format!("Unknown code: {}", code_int)))?;
+
+    // Parse other attributes
+    let from = parse_header_field(lines.next(), "From")?;
+    let body = parse_header_field(lines.next(), "Body")?;
+    let to = parse_header_field(lines.next(), "To")?;
+
+    Ok(FctpMessage {
         code,
         from,
         body,
         to,
     })
 }
+
+fn parse_header_field(line: Option<&str>, field_name: &str) -> Result<String> {
+    let line =
+        line.ok_or_else(|| FctpError::MalformedMessage(format!("Missing {} line", field_name)))?;
+
+    let prefix = format!("{}: ", field_name);
+    line.strip_prefix(&prefix)
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| {
+            FctpError::MalformedMessage(format!("Invalid {} format: {}", field_name, line))
+        })
+}
+
+//Sending a message
 pub async fn send_fctp_message(
     client_info: &mut fctp_client::ClientInfo,
-    code: i32,
-    from: &str,
-    body: &str,
-    to: &str,
-) {
+    message: &FctpMessage,
+) -> Result<()> {
     let mut writer = client_info.socket.lock().await;
+    let encrypted_msg = encapsulate_to_fctp(message, &client_info.conn_session_key)?;
 
-    let encrypted_msg = encapsulate_to_fctp(code, from, body, to, client_info.conn_session_key);
+    writer
+        .write_all(&encrypted_msg)
+        .await
+        .map_err(|e| FctpError::NetworkError(format!("Failed to send message: {}", e)))?;
 
-    if !encrypted_msg.is_empty() {
-        if let Err(e) = writer.write_all(&encrypted_msg).await {
-            eprintln!("Failed to send FCTP message: {:?}", e);
-        }
-    } else {
-        eprintln!("Failed to encrypt FCTP message - empty result");
-    }
+    Ok(())
 }
-//Finding ... by nick
-async fn find_key_by_nick(clients: &fctp_client::Clients, nick: &str) -> Option<PublicKey> {
+
+//Helpers
+async fn find_client_by_nick(
+    clients: &fctp_client::Clients,
+    nick: &str,
+) -> Option<(String, PublicKey)> {
     let map = clients.lock().await;
     map.iter()
         .find(|(_, client)| client.ext_session_username == nick)
-        .map(|(_, client)| client.conn_e2ee_public)
+        .map(|(id, client)| (id.clone(), client.conn_e2ee_public))
 }
 
-async fn find_id_by_nick(clients: &fctp_client::Clients, nick: &str) -> Option<String> {
-    let map = clients.lock().await;
-    map.iter()
-        .find(|(_, client)| client.ext_session_username == nick)
-        .map(|(id, _)| id.clone())
-}
-//Nick taken checker
 async fn is_nick_taken(clients: &fctp_client::Clients, nick: &str, current_id: &str) -> bool {
     let map = clients.lock().await;
     map.iter()
         .any(|(id, client)| id != current_id && client.ext_session_username == nick)
 }
-//encrypted message handler
+
+fn validate_nickname(nick: &str) -> Result<()> {
+    if nick.len() < MIN_NICK_LENGTH || nick.len() > MAX_NICK_LENGTH {
+        return Err(FctpError::InvalidNickname(format!(
+            "Nickname must be between {} and {} characters",
+            MIN_NICK_LENGTH, MAX_NICK_LENGTH
+        )));
+    }
+
+    if !nick
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(FctpError::InvalidNickname(
+            "Nickname can only contain letters, numbers, underscores and hyphens".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+//------------------------------Handlers------------------------------
+
+//FCTP message handler
+
 pub async fn handle_fctp_message(
     msg: &[u8],
     client_id: &str,
     session_key: Key<Aes256Gcm>,
     clients: &fctp_client::Clients,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(fctp_message) = decapsulate_fctp_message(msg, session_key) {
-        println!(
-            "{},{},{},{}",
-            fctp_message.code, fctp_message.from, fctp_message.body, fctp_message.to
+) -> Result<()> {
+    let fctp_message = decapsulate_fctp_message(msg, &session_key)?;
+
+    println!(
+        "FCTP: {} -> {} [{}]: {}",
+        fctp_message.from, fctp_message.to, fctp_message.code as i32, fctp_message.body
+    );
+
+    match fctp_message.code {
+        FctpCode::Message => handle_message_routing(fctp_message, client_id, clients).await,
+        FctpCode::Ping => handle_ping(client_id, clients).await,
+        FctpCode::Hello => handle_client_join(client_id, clients).await,
+        FctpCode::PublicKeyExchange => {
+            handle_public_key_exchange(fctp_message, client_id, clients).await
+        }
+        FctpCode::KeyRequest => handle_key_request(fctp_message, client_id, clients).await,
+        FctpCode::Command => handle_command(fctp_message, client_id, clients).await,
+        _ => {
+            send_error_to_client(
+                client_id,
+                clients,
+                FctpCode::MethodNotAllowed,
+                "Unsupported message code",
+            )
+            .await
+        }
+    }
+}
+
+//Route a message
+async fn handle_message_routing(
+    fctp_message: FctpMessage,
+    sender_id: &str,
+    clients: &fctp_client::Clients,
+) -> Result<()> {
+    let recipient_nick = fctp_message.to.trim();
+
+    //Find recipient ID
+    let recipient_id = if let Some((id, _)) = find_client_by_nick(clients, recipient_nick).await {
+        id
+    } else {
+        recipient_nick.to_string()
+    };
+
+    //Get sender nick
+    let sender_nick = {
+        let map = clients.lock().await;
+        map.get(sender_id)
+            .map(|c| c.ext_session_username.clone())
+            .unwrap_or_else(|| sender_id.to_string())
+    };
+
+    //Send message to recipient
+    let mut map = clients.lock().await;
+    if let Some(_recipient_info) = map.get_mut(&recipient_id) {
+        let message = FctpMessage::new(
+            FctpCode::Message,
+            sender_nick,
+            fctp_message.body,
+            recipient_id.clone(),
         );
-        match fctp_message.code {
-            200 => {
-                //default message route code
-                let recipient = fctp_message.to.trim();
-                let recipient_id = if let Some(id) = find_id_by_nick(clients, recipient).await {
-                    id
-                } else {
-                    recipient.to_string()
-                };
+        drop(map); //DROP A LOCK!
 
-                let sender_nick = {
-                    let map = clients.lock().await;
-                    map.get(client_id)
-                        .map(|c| c.ext_session_username.clone())
-                        .unwrap_or_else(|| client_id.to_string())
-                };
-
-                let mut map = clients.lock().await;
-                if let Some(recipient_info) = map.get_mut(&recipient_id) {
-                    send_fctp_message(
-                        recipient_info,
-                        200,
-                        &sender_nick,
-                        &fctp_message.body,
-                        &recipient_id,
-                    )
-                    .await;
-                } else {
-                    if let Some(sender_info) = map.get_mut(client_id) {
-                        send_fctp_message(
-                            sender_info,
-                            405,
-                            get_id(),
-                            "Recipient not found",
-                            client_id,
-                        )
-                        .await;
-                    }
-                }
-            }
-            10 => {
-                // Ping
-                let mut map = clients.lock().await;
-                if let Some(client_info) = map.get_mut(client_id) {
-                    send_fctp_message(client_info, 11, get_id(), "pong", client_id).await;
-                }
-            }
-            900 => {
-                let mut map = clients.lock().await;
-                if let Some(client_info) = map.get_mut(client_id) {
-                    //send id information
-                    send_fctp_message(client_info, 900, get_id(), "id", client_id).await;
-                    //MOTD
-                    send_fctp_message(
-                        client_info,
-                        201,
-                        get_id(),
-                        &format!("Welcome to Loop64.com FoggyChat server."),
-                        client_id,
-                    )
-                    .await;
-                }
-            }
-            901 => {
-                let mut map = clients.lock().await;
-                if let Some(client_info) = map.get_mut(client_id) {
-                    let decoded = crypt::utils::base64_decode(&fctp_message.body.trim())
-                        .expect("Failed decoding message");
-                    let pk_bytes: [u8; 32] = match TryInto::<[u8; 32]>::try_into(decoded) {
-                        Ok(val) => val,
-                        Err(_) => {
-                            kick_client(clients, client_id).await;
-                            [0u8; 32]
-                        }
-                    };
-                    //set public key of the user
-                    client_info.conn_e2ee_public = PublicKey::from(pk_bytes);
-                }
-            }
-            902 => {
-                let found_pk = find_key_by_nick(clients, &fctp_message.body.trim()).await;
-
-                let mut map = clients.lock().await;
-                if let Some(client_info) = map.get_mut(client_id) {
-                    //find key by nick in fctp message body and respond with it
-
-                    //TODO: no key message handling
-                    if let Some(pk) = found_pk {
-                        send_fctp_message(
-                            client_info,
-                            902,
-                            get_id(),
-                            &crypt::utils::base64_encode(pk.as_bytes()),
-                            client_id,
-                        )
-                        .await;
-                    } else {
-                        send_fctp_message(
-                            client_info,
-                            505,
-                            get_id(),
-                            "Couldn't find user key",
-                            client_id,
-                        )
-                        .await;
-                    }
-                }
-            }
-            201 => {
-                let mut clients_guard = clients.lock().await;
-                if let Some(client_info) = clients_guard.get_mut(client_id) {
-                    let mut client_info_clone = client_info.clone();
-                    drop(clients_guard);
-                    //handle user commands on code 201
-
-                    command_handler(
-                        fctp_message,
-                        &mut client_id.to_string(),
-                        &mut client_info_clone,
-                        clients,
-                    )
-                    .await;
-
-                    let mut clients_guard = clients.lock().await;
-                    if let Some(client_info) = clients_guard.get_mut(client_id) {
-                        client_info.ext_session_username = client_info_clone.ext_session_username;
-                    }
-                }
-            }
-            _ => {
-                //unsupported code
-                let mut map = clients.lock().await;
-                if let Some(client_info) = map.get_mut(client_id) {
-                    send_fctp_message(
-                        client_info,
-                        405,
-                        get_id(),
-                        "Unsupported header code",
-                        client_id,
-                    )
-                    .await;
-                }
-            }
+        let mut map = clients.lock().await;
+        if let Some(recipient_info) = map.get_mut(&recipient_id) {
+            send_fctp_message(recipient_info, &message).await?;
         }
     } else {
-        let mut map = clients.lock().await;
-        if let Some(client_info) = map.get_mut(client_id) {
-            send_fctp_message(client_info, 505, get_id(), "Malformed message", client_id).await;
+        //Recipient does not exist
+        if let Some(sender_info) = map.get_mut(sender_id) {
+            let error_msg =
+                FctpMessage::error(FctpCode::MethodNotAllowed, "Recipient not found", sender_id);
+            send_fctp_message(sender_info, &error_msg).await?;
         }
     }
 
     Ok(())
 }
-pub async fn command_handler(
+async fn handle_ping(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        let pong_msg = FctpMessage::pong(client_id);
+        send_fctp_message(client_info, &pong_msg).await?;
+    }
+    Ok(())
+}
+
+async fn handle_client_join(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        // tell a client his id
+        let id_msg = FctpMessage::new(FctpCode::Hello, get_id(), "id", client_id);
+        send_fctp_message(client_info, &id_msg).await?;
+
+        // MOTD
+        let motd_msg = FctpMessage::new(
+            FctpCode::Command,
+            get_id(),
+            "Welcome to Loop64.com FoggyChat server!",
+            client_id,
+        );
+        send_fctp_message(client_info, &motd_msg).await?;
+    }
+    Ok(())
+}
+
+async fn handle_public_key_exchange(
     fctp_message: FctpMessage,
-    id_clone: &mut String,
-    client_info: &mut fctp_client::ClientInfo,
+    client_id: &str,
     clients: &fctp_client::Clients,
-) {
+) -> Result<()> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        let decoded = crypt::utils::base64_decode(fctp_message.body.trim())
+            .map_err(|e| FctpError::MalformedMessage(format!("Base64 decode error: {:?}", e)))?;
+
+        let pk_bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| FctpError::MalformedMessage("Invalid public key length".to_string()))?;
+
+        client_info.conn_e2ee_public = PublicKey::from(pk_bytes);
+    }
+    Ok(())
+}
+
+async fn handle_key_request(
+    fctp_message: FctpMessage,
+    client_id: &str,
+    clients: &fctp_client::Clients,
+) -> Result<()> {
+    let requested_nick = fctp_message.body.trim();
+    let found_key = find_client_by_nick(clients, requested_nick).await;
+
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        if let Some((_, pk)) = found_key {
+            let key_response = FctpMessage::new(
+                FctpCode::KeyRequest,
+                get_id(),
+                crypt::utils::base64_encode(pk.as_bytes()),
+                client_id,
+            );
+            send_fctp_message(client_info, &key_response).await?;
+        } else {
+            let error_msg = FctpMessage::error(
+                FctpCode::ServiceUnavailable,
+                "User key not found",
+                client_id,
+            );
+            send_fctp_message(client_info, &error_msg).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_command(
+    fctp_message: FctpMessage,
+    client_id: &str,
+    clients: &fctp_client::Clients,
+) -> Result<()> {
     let body = fctp_message.body.trim();
     let mut parts = body.split_whitespace();
     let command = parts.next().unwrap_or("");
@@ -290,110 +410,175 @@ pub async fn command_handler(
                 "Welcome to server! ServerID: {} / Available commands: help, whoami, setnick <name>",
                 get_id()
             );
-            send_fctp_message(client_info, 201, get_id(), &msg, id_clone).await;
+            send_command_response(client_id, clients, &msg).await
         }
-
-        "whoami" => {
-            let msg = format!(
-                "You are connected as: {} / Your session nick: {} / ServerID: {} / Connected for: {} seconds / Your E2EE public key (base64): {}",
-                id_clone,
-                client_info.ext_session_username,
-                get_id(),
-                client_info.ext_connected_at.elapsed().as_secs(),
-                crypt::utils::base64_encode(client_info.conn_e2ee_public.as_bytes())
-            );
-            send_fctp_message(client_info, 201, get_id(), &msg, id_clone).await;
-        }
-        "setnick" => {
-            if let Some(new_name) = parts.next() {
-                if is_nick_taken(clients, new_name, id_clone).await {
-                    let msg = format!(
-                        "Nick '{}' is already taken. Choose a different one.",
-                        new_name
-                    );
-                    send_fctp_message(client_info, 405, get_id(), &msg, id_clone).await;
-                } else {
-                    if new_name.len() < 3 || new_name.len() > 20 {
-                        let msg = "Nick must be between 3 and 20 characters long.".to_string();
-                        send_fctp_message(client_info, 405, get_id(), &msg, id_clone).await;
-                    } else if !new_name
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                    {
-                        let msg =
-                            "Nick can only contain letters, numbers, underscores and hyphens."
-                                .to_string();
-                        send_fctp_message(client_info, 405, get_id(), &msg, id_clone).await;
-                    } else {
-                        client_info.ext_session_username = new_name.to_owned();
-                        let msg = format!(
-                            "Nick changed to: {} / ServerID: {}",
-                            client_info.ext_session_username,
-                            get_id()
-                        );
-                        send_fctp_message(client_info, 201, get_id(), &msg, id_clone).await;
-                    }
-                }
-            } else {
-                let msg = "Usage: setnick <new_name>".to_string();
-                send_fctp_message(client_info, 400, get_id(), &msg, id_clone).await;
-            }
-        }
-
+        "whoami" => handle_whoami_command(client_id, clients).await,
+        "setnick" => handle_setnick_command(parts.next(), client_id, clients).await,
         _ => {
             let msg = format!(
                 "Unknown command: {}. Type 'help' for available commands.",
-                body
+                command
             );
-            send_fctp_message(client_info, 405, get_id(), &msg, id_clone).await;
+            send_error_to_client(client_id, clients, FctpCode::MethodNotAllowed, &msg).await
         }
     }
+}
+
+async fn handle_whoami_command(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
+    let map = clients.lock().await;
+    if let Some(client_info) = map.get(client_id) {
+        let msg = format!(
+            "You are connected as: {} / Your session nick: {} / ServerID: {} / Connected for: {} seconds / Your E2EE public key (base64): {}",
+            client_id,
+            client_info.ext_session_username,
+            get_id(),
+            client_info.ext_connected_at.elapsed().as_secs(),
+            crypt::utils::base64_encode(client_info.conn_e2ee_public.as_bytes())
+        );
+        drop(map);
+        send_command_response(client_id, clients, &msg).await?;
+    }
+    Ok(())
+}
+
+async fn handle_setnick_command(
+    new_nick: Option<&str>,
+    client_id: &str,
+    clients: &fctp_client::Clients,
+) -> Result<()> {
+    let Some(new_nick) = new_nick else {
+        return send_error_to_client(
+            client_id,
+            clients,
+            FctpCode::BadRequest,
+            "Usage: setnick <new_name>",
+        )
+        .await;
+    };
+
+    // Validate nickname regex
+    if let Err(e) = validate_nickname(new_nick) {
+        return send_error_to_client(
+            client_id,
+            clients,
+            FctpCode::MethodNotAllowed,
+            &e.to_string(),
+        )
+        .await;
+    }
+
+    // Check nick availability
+    if is_nick_taken(clients, new_nick, client_id).await {
+        let msg = format!(
+            "Nick '{}' is already taken. Choose a different one.",
+            new_nick
+        );
+        return send_error_to_client(client_id, clients, FctpCode::MethodNotAllowed, &msg).await;
+    }
+
+    // Set nick
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        client_info.ext_session_username = new_nick.to_string();
+        let msg = format!(
+            "Nick changed to: {} / ServerID: {}",
+            client_info.ext_session_username,
+            get_id()
+        );
+        drop(map);
+        send_command_response(client_id, clients, &msg).await?;
+    }
+
+    Ok(())
+}
+
+//Sending helpers (sending with auto-mapping client)
+
+async fn send_command_response(
+    client_id: &str,
+    clients: &fctp_client::Clients,
+    message: &str,
+) -> Result<()> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        let response = FctpMessage::new(FctpCode::Command, get_id(), message, client_id);
+        send_fctp_message(client_info, &response).await?;
+    }
+    Ok(())
+}
+
+async fn send_error_to_client(
+    client_id: &str,
+    clients: &fctp_client::Clients,
+    error_code: FctpCode,
+    message: &str,
+) -> Result<()> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        let error_msg = FctpMessage::error(error_code, message, client_id);
+        send_fctp_message(client_info, &error_msg).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::{Aes256Gcm, Key};
 
     #[test]
-    fn test_fctp_encapsulation_and_decapsulation_binary() {
-        let code = 200;
-        let from = "user123";
-        let body = "Hello, world!";
-        let to = "user456";
-
-        let real_key = crate::crypt::symmetric::keygen();
-        let encrypted_message = encapsulate_to_fctp(code, from, body, to, real_key);
-
-        assert!(!encrypted_message.is_empty());
-
-        let decoded = decapsulate_fctp_message(&encrypted_message, real_key)
-            .expect("Failed to parse FCTP message");
-
-        assert_eq!(decoded.code, code);
-        assert_eq!(decoded.from, from);
-        assert_eq!(decoded.body, body);
-        assert_eq!(decoded.to, to);
+    fn test_fctp_code_conversion() {
+        assert_eq!(FctpCode::from_i32(200), Some(FctpCode::Message));
+        assert_eq!(FctpCode::from_i32(999), None);
     }
 
     #[test]
-    fn test_fctp_decapsulation_invalid_binary() {
-        let real_key = crate::crypt::symmetric::keygen();
-        let bad_message = b"This is not a valid encrypted FCTP message";
-        assert!(decapsulate_fctp_message(bad_message, real_key).is_none());
-
-        let empty_message = b"";
-        assert!(decapsulate_fctp_message(empty_message, real_key).is_none());
+    fn test_message_creation() {
+        let msg = FctpMessage::new(FctpCode::Message, "alice", "hello", "bob");
+        assert_eq!(msg.code, FctpCode::Message);
+        assert_eq!(msg.from, "alice");
+        assert_eq!(msg.body, "hello");
+        assert_eq!(msg.to, "bob");
     }
 
     #[test]
-    fn test_parse_fctp_message_direct() {
-        let valid_message = "FoggyChat Transfer Protocol 0.1\r\n200\r\nFrom: test\r\nBody: hello\r\nTo: user\r\n\r\n";
-        let parsed = parse_fctp_message(valid_message).expect("Should parse valid message");
+    fn test_nickname_validation() {
+        assert!(validate_nickname("alice").is_ok());
+        assert!(validate_nickname("alice_123").is_ok());
+        assert!(validate_nickname("ab").is_err()); // short
+        assert!(validate_nickname("a".repeat(25).as_str()).is_err()); // long
+        assert!(validate_nickname("alice@bob").is_err()); //illegal characters
+    }
 
-        assert_eq!(parsed.code, 200);
-        assert_eq!(parsed.from, "test");
+    #[test]
+    fn test_fctp_encapsulation_and_decapsulation() {
+        let msg = FctpMessage::new(FctpCode::Message, "alice", "hello world", "bob");
+        let key = crate::crypt::symmetric::keygen();
+
+        let encrypted = encapsulate_to_fctp(&msg, &key).expect("Should encrypt");
+        assert!(!encrypted.is_empty());
+
+        let decrypted = decapsulate_fctp_message(&encrypted, &key).expect("Should decrypt");
+        assert_eq!(decrypted, msg);
+    }
+
+    #[test]
+    fn test_parse_fctp_message() {
+        let message_str = format!(
+            "{}\r\n{}\r\nFrom: {}\r\nBody: {}\r\nTo: {}\r\n\r\n",
+            PROTOCOL_VERSION, 200, "alice", "hello", "bob"
+        );
+
+        let parsed = parse_fctp_message(&message_str).expect("Should parse");
+        assert_eq!(parsed.code, FctpCode::Message);
+        assert_eq!(parsed.from, "alice");
         assert_eq!(parsed.body, "hello");
-        assert_eq!(parsed.to, "user");
+        assert_eq!(parsed.to, "bob");
+    }
+
+    #[test]
+    fn test_invalid_protocol_version() {
+        let invalid_message =
+            "Invalid Protocol 1.0\r\n200\r\nFrom: alice\r\nBody: hello\r\nTo: bob\r\n\r\n";
+        assert!(parse_fctp_message(invalid_message).is_err());
     }
 }

@@ -1,4 +1,9 @@
-#![warn(dead_code)] // Maybe in some time I will use this shit
+#![warn(dead_code)]
+use crate::{
+    get_id,
+    protocol_utils::fctp::{FctpCode, FctpMessage, send_fctp_message},
+};
+
 use super::fctp_client::Clients;
 
 pub async fn send_broadcast(
@@ -9,7 +14,8 @@ pub async fn send_broadcast(
     let mut map = clients.lock().await;
     for (client_id, client_info) in map.iter_mut() {
         if client_id != id {
-            super::fctp::send_fctp_message(client_info, 201, crate::get_id(), msg, client_id).await;
+            let id_msg = FctpMessage::new(FctpCode::Command, get_id(), msg, client_id);
+            send_fctp_message(client_info, &id_msg).await?;
         }
     }
     Ok(())
