@@ -6,7 +6,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     crypt::{self, asymmetric},
-    protocol_utils::fctp_client::Clients,
+    protocol_utils::{
+        fctp::{FctpError, FctpMessage},
+        fctp_client::{self, Clients},
+    },
 };
 
 lazy_static! {
@@ -63,5 +66,24 @@ pub async fn handle_key_exchange(
         println!("Sent session key to client: {}", client_id);
     }
 
+    Ok(())
+}
+
+pub async fn handle_public_key_exchange(
+    fctp_message: FctpMessage,
+    client_id: &str,
+    clients: &fctp_client::Clients,
+) -> Result<(), FctpError> {
+    let mut map = clients.lock().await;
+    if let Some(client_info) = map.get_mut(client_id) {
+        let decoded = crypt::utils::base64_decode(fctp_message.body.trim())
+            .map_err(|e| FctpError::MalformedMessage(format!("Base64 decode error: {:?}", e)))?;
+
+        let pk_bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| FctpError::MalformedMessage("Invalid public key length".to_string()))?;
+
+        client_info.conn_e2ee_public = PublicKey::from(pk_bytes);
+    }
     Ok(())
 }

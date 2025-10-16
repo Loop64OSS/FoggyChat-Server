@@ -22,8 +22,6 @@ pub enum FctpError {
     InvalidProtocolVersion(String),
     #[error("Network error: {0}")]
     NetworkError(String),
-    #[error("Client not found: {0}")]
-    ClientNotFound(String),
     #[error("Invalid nickname: {0}")]
     InvalidNickname(String),
 }
@@ -90,15 +88,15 @@ impl FctpMessage {
             to: to.into(),
         }
     }
-
+    #[allow(dead_code)]
     pub fn ping(to: impl Into<String>) -> Self {
         Self::new(FctpCode::Ping, get_id(), "ping", to)
     }
-
+    #[allow(dead_code)]
     pub fn pong(to: impl Into<String>) -> Self {
         Self::new(FctpCode::Pong, get_id(), "pong", to)
     }
-
+    #[allow(dead_code)]
     pub fn error(code: FctpCode, message: impl Into<String>, to: impl Into<String>) -> Self {
         Self::new(code, get_id(), message, to)
     }
@@ -234,7 +232,6 @@ fn validate_nickname(nick: &str) -> Result<()> {
 //------------------------------Handlers------------------------------
 
 //FCTP message handler
-
 pub async fn handle_fctp_message(
     msg: &[u8],
     client_id: &str,
@@ -253,9 +250,14 @@ pub async fn handle_fctp_message(
         FctpCode::Ping => handle_ping(client_id, clients).await,
         FctpCode::Hello => handle_client_join(client_id, clients).await,
         FctpCode::PublicKeyExchange => {
-            handle_public_key_exchange(fctp_message, client_id, clients).await
+            crate::protocol_utils::fctp_secure::handle_public_key_exchange(
+                fctp_message,
+                client_id,
+                clients,
+            )
+            .await
         }
-        FctpCode::KeyRequest => handle_key_request(fctp_message, client_id, clients).await,
+        FctpCode::KeyRequest => handle_e2ee_key_request(fctp_message, client_id, clients).await,
         FctpCode::Command => handle_command(fctp_message, client_id, clients).await,
         _ => {
             send_error_to_client(
@@ -346,26 +348,7 @@ async fn handle_client_join(client_id: &str, clients: &fctp_client::Clients) -> 
     Ok(())
 }
 
-async fn handle_public_key_exchange(
-    fctp_message: FctpMessage,
-    client_id: &str,
-    clients: &fctp_client::Clients,
-) -> Result<()> {
-    let mut map = clients.lock().await;
-    if let Some(client_info) = map.get_mut(client_id) {
-        let decoded = crypt::utils::base64_decode(fctp_message.body.trim())
-            .map_err(|e| FctpError::MalformedMessage(format!("Base64 decode error: {:?}", e)))?;
-
-        let pk_bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| FctpError::MalformedMessage("Invalid public key length".to_string()))?;
-
-        client_info.conn_e2ee_public = PublicKey::from(pk_bytes);
-    }
-    Ok(())
-}
-
-async fn handle_key_request(
+async fn handle_e2ee_key_request(
     fctp_message: FctpMessage,
     client_id: &str,
     clients: &fctp_client::Clients,

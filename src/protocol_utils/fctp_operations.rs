@@ -1,4 +1,4 @@
-#![warn(dead_code)]
+#![allow(dead_code)]
 use crate::{
     get_id,
     protocol_utils::fctp::{FctpCode, FctpMessage, send_fctp_message},
