@@ -9,7 +9,8 @@ use crate::{
     get_id,
     protocol_utils::fctp_client,
 };
-//Internal errors
+
+/* Error types used by FCTP handlers */
 #[derive(Error, Debug)]
 pub enum FctpError {
     #[error("Encryption failed: {0}")]
@@ -25,13 +26,15 @@ pub enum FctpError {
     #[error("Invalid nickname: {0}")]
     InvalidNickname(String),
 }
-//Statics
+/* Local result alias */
 type Result<T> = std::result::Result<T, FctpError>;
 
+/* Protocol constants */
 const PROTOCOL_VERSION: &str = "FoggyChat Transfer Protocol 0.1";
 const MIN_NICK_LENGTH: usize = 3;
 const MAX_NICK_LENGTH: usize = 20;
-// Protocol codes
+
+/* FCTP message codes */
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FctpCode {
     Ping = 10,
@@ -47,6 +50,7 @@ pub enum FctpCode {
     KeyRequest = 902,
 }
 
+/* conversion helper for numeric codes */
 impl FctpCode {
     fn from_i32(code: i32) -> Option<Self> {
         match code {
@@ -66,6 +70,7 @@ impl FctpCode {
     }
 }
 
+/* In-memory representation of an FCTP message */
 #[derive(Debug, Clone, PartialEq)]
 pub struct FctpMessage {
     pub code: FctpCode,
@@ -75,6 +80,7 @@ pub struct FctpMessage {
 }
 
 impl FctpMessage {
+    /* constructor helper */
     pub fn new(
         code: FctpCode,
         from: impl Into<String>,
@@ -92,16 +98,18 @@ impl FctpMessage {
     pub fn ping(to: impl Into<String>) -> Self {
         Self::new(FctpCode::Ping, get_id(), "ping", to)
     }
+
     #[allow(dead_code)]
     pub fn pong(to: impl Into<String>) -> Self {
         Self::new(FctpCode::Pong, get_id(), "pong", to)
     }
+
     #[allow(dead_code)]
     pub fn error(code: FctpCode, message: impl Into<String>, to: impl Into<String>) -> Self {
         Self::new(code, get_id(), message, to)
     }
 }
-// Header tools
+/* Header tools: encapsulate/decapsulate FCTP messages */
 pub fn encapsulate_to_fctp(message: &FctpMessage, session_key: &Key<Aes256Gcm>) -> Result<Vec<u8>> {
     let formatted_message = format!(
         "{}\r\n{}\r\nFrom: {}\r\nBody: {}\r\nTo: {}\r\n\r\n",
@@ -111,7 +119,7 @@ pub fn encapsulate_to_fctp(message: &FctpMessage, session_key: &Key<Aes256Gcm>) 
     symmetric::encrypt_binary(&formatted_message, session_key)
         .map_err(|e| FctpError::EncryptionFailed(format!("{:?}", e)))
 }
-
+/* Decrypt and parse an FCTP frame */
 pub fn decapsulate_fctp_message(msg: &[u8], session_key: &Key<Aes256Gcm>) -> Result<FctpMessage> {
     let decrypted_str = if *session_key == Key::<Aes256Gcm>::default() {
         // Unencrypted message!
@@ -126,7 +134,7 @@ pub fn decapsulate_fctp_message(msg: &[u8], session_key: &Key<Aes256Gcm>) -> Res
 
     parse_fctp_message(&decrypted_str)
 }
-
+/* Parse a plaintext FCTP message into an FctpMessage struct */
 fn parse_fctp_message(message: &str) -> Result<FctpMessage> {
     let mut lines = message.lines();
 
@@ -164,7 +172,7 @@ fn parse_fctp_message(message: &str) -> Result<FctpMessage> {
         to,
     })
 }
-
+/* Helper to parse a single header field like 'From: ...' */
 fn parse_header_field(line: Option<&str>, field_name: &str) -> Result<String> {
     let line =
         line.ok_or_else(|| FctpError::MalformedMessage(format!("Missing {} line", field_name)))?;
@@ -176,8 +184,7 @@ fn parse_header_field(line: Option<&str>, field_name: &str) -> Result<String> {
             FctpError::MalformedMessage(format!("Invalid {} format: {}", field_name, line))
         })
 }
-
-//Sending a message
+/* Send an FCTP message over the client's socket */
 pub async fn send_fctp_message(
     client_info: &mut fctp_client::ClientInfo,
     message: &FctpMessage,
@@ -192,8 +199,7 @@ pub async fn send_fctp_message(
 
     Ok(())
 }
-
-//Helpers
+/* Helper: find a client by session nickname */
 async fn find_client_by_nick(
     clients: &fctp_client::Clients,
     nick: &str,
@@ -203,13 +209,13 @@ async fn find_client_by_nick(
         .find(|(_, client)| client.ext_session_username == nick)
         .map(|(id, client)| (id.clone(), client.conn_e2ee_public))
 }
-
+/* Check if a nickname is already used by another session */
 async fn is_nick_taken(clients: &fctp_client::Clients, nick: &str, current_id: &str) -> bool {
     let map = clients.lock().await;
     map.iter()
         .any(|(id, client)| id != current_id && client.ext_session_username == nick)
 }
-
+/* Validate nickname length and allowed characters */
 fn validate_nickname(nick: &str) -> Result<()> {
     if nick.len() < MIN_NICK_LENGTH || nick.len() > MAX_NICK_LENGTH {
         return Err(FctpError::InvalidNickname(format!(
@@ -229,9 +235,9 @@ fn validate_nickname(nick: &str) -> Result<()> {
 
     Ok(())
 }
-//------------------------------Handlers------------------------------
+/* -------------------- Handlers -------------------- */
 
-//FCTP message handler
+/* Main FCTP message dispatcher */
 pub async fn handle_fctp_message(
     msg: &[u8],
     client_id: &str,
@@ -270,8 +276,7 @@ pub async fn handle_fctp_message(
         }
     }
 }
-
-//Route a message
+/* Route an incoming chat message to a recipient */
 async fn handle_message_routing(
     fctp_message: FctpMessage,
     sender_id: &str,
@@ -320,6 +325,7 @@ async fn handle_message_routing(
 
     Ok(())
 }
+/* Reply to ping with pong */
 async fn handle_ping(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
     let mut map = clients.lock().await;
     if let Some(client_info) = map.get_mut(client_id) {
@@ -328,7 +334,7 @@ async fn handle_ping(client_id: &str, clients: &fctp_client::Clients) -> Result<
     }
     Ok(())
 }
-
+/* Handle client join/hello: send ID and MOTD */
 async fn handle_client_join(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
     let mut map = clients.lock().await;
     if let Some(client_info) = map.get_mut(client_id) {
@@ -347,7 +353,7 @@ async fn handle_client_join(client_id: &str, clients: &fctp_client::Clients) -> 
     }
     Ok(())
 }
-
+/* Handle E2EE public key request for a given nickname */
 async fn handle_e2ee_key_request(
     fctp_message: FctpMessage,
     client_id: &str,
@@ -377,7 +383,7 @@ async fn handle_e2ee_key_request(
     }
     Ok(())
 }
-
+/* Handle textual commands from clients (help, whoami, setnick) */
 async fn handle_command(
     fctp_message: FctpMessage,
     client_id: &str,
@@ -406,7 +412,7 @@ async fn handle_command(
         }
     }
 }
-
+/* Implementation of 'whoami' command */
 async fn handle_whoami_command(client_id: &str, clients: &fctp_client::Clients) -> Result<()> {
     let map = clients.lock().await;
     if let Some(client_info) = map.get(client_id) {
@@ -423,7 +429,7 @@ async fn handle_whoami_command(client_id: &str, clients: &fctp_client::Clients) 
     }
     Ok(())
 }
-
+/* Implementation of 'setnick' command */
 async fn handle_setnick_command(
     new_nick: Option<&str>,
     client_id: &str,
@@ -474,8 +480,7 @@ async fn handle_setnick_command(
 
     Ok(())
 }
-
-//Sending helpers (sending with auto-mapping client)
+/* Sending helpers (create Command/Error messages and send) */
 
 async fn send_command_response(
     client_id: &str,
@@ -489,7 +494,7 @@ async fn send_command_response(
     }
     Ok(())
 }
-
+/* Send an error response to a client */
 async fn send_error_to_client(
     client_id: &str,
     clients: &fctp_client::Clients,
