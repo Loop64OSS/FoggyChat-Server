@@ -12,11 +12,13 @@ use crate::{
     },
 };
 
+/* Certificate storage (server cert used during key exchange) */
 lazy_static! {
     static ref CERT_PUB: RwLock<PublicKey> = RwLock::new(PublicKey::from([0u8; 32]));
     static ref CERT_SEC: RwLock<StaticSecret> = RwLock::new(StaticSecret::from([0u8; 32]));
 }
 
+/* Set server certificate keypair */
 pub fn set_cert(new_pubkey: PublicKey, new_sec: StaticSecret) {
     let mut pubkey = CERT_PUB.write().expect("Lock poisoned");
     *pubkey = new_pubkey;
@@ -24,12 +26,18 @@ pub fn set_cert(new_pubkey: PublicKey, new_sec: StaticSecret) {
     *sec = new_sec;
 }
 
+/* Return server certificate public key */
 pub fn get_cert_pub() -> PublicKey {
     CERT_PUB.read().expect("Lock poisoned").clone()
 }
+
+/* Return server certificate secret */
 pub fn get_cert_sec() -> StaticSecret {
     CERT_SEC.read().expect("Lock poisoned").clone()
 }
+
+/* Handle client's exchange message: decrypt client's exchange pubkey and
+respond with encrypted session key. */
 pub async fn handle_key_exchange(
     msg: &[u8],
     client_id: &str,
@@ -69,6 +77,7 @@ pub async fn handle_key_exchange(
     Ok(())
 }
 
+/* Handle a client's PublicKeyExchange message (store client's E2EE public key) */
 pub async fn handle_public_key_exchange(
     fctp_message: FctpMessage,
     client_id: &str,

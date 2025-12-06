@@ -19,25 +19,33 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/* Protocol types and helpers (FCTP) */
 use crate::protocol_utils::fctp::FctpCode;
 use crate::protocol_utils::fctp::FctpMessage;
 use crate::protocol_utils::fctp::send_fctp_message;
+
+/* Client connection types */
 use crate::protocol_utils::fctp_client::ClientInfo;
 use crate::protocol_utils::fctp_client::Clients;
+
+/* Certificate helpers */
 use crate::protocol_utils::fctp_secure::get_cert_pub;
 use crate::protocol_utils::fctp_secure::get_cert_sec;
 use crate::protocol_utils::fctp_secure::set_cert;
 
+/* Read buffer size for client sockets */
 const BUFFER_SIZE: usize = 8096;
 
 static ID: OnceLock<String> = OnceLock::new();
 
+/* set_id: register the server's static ID once */
 pub fn set_id(new_id: &str) {
     ID.set(new_id.to_owned()).unwrap_or_else(|_| {
         eprintln!("Unauthorized action: Cannot reregister server!");
     })
 }
 
+/* get_id: return registered server ID or exit if unset */
 pub fn get_id() -> &'static str {
     ID.get().map(|s| s.as_str()).unwrap_or_else(|| {
         eprintln!("Unauthorized action: Unregistered server! Halting execution.");
@@ -45,11 +53,13 @@ pub fn get_id() -> &'static str {
     })
 }
 
+/* generate_id: return a new random UUID v4 */
 fn generate_id() -> uuid::Uuid {
     let uuid = Uuid::new_v4();
     uuid
 }
 
+/* handle_client: per-connection async handler */
 async fn handle_client(
     socket: tokio::net::TcpStream,
     clients: Clients,
@@ -68,11 +78,13 @@ async fn handle_client(
         ext_rate_limit_burst_count: 2,
     };
 
+    /* register client in shared clients map */
     {
         let mut map = clients.lock().await;
         map.insert(id.clone(), client_info.clone());
     }
 
+    /* send base64(server public key) + CRLFCRLF as initial handshake */
     {
         let mut map = clients.lock().await;
         if let Some(client_info) = map.get_mut(&id) {
@@ -90,6 +102,8 @@ async fn handle_client(
         }
     }
 
+    /* read loop: route to key-exchange or FCTP handler */
+    /* rate limiting: warmup, small burst, then 500ms spacing */
     let mut buf = [0u8; BUFFER_SIZE];
     loop {
         match reader.read(&mut buf).await {
@@ -162,7 +176,7 @@ async fn handle_client(
         }
     }
 
-    // Cleanup
+    /* cleanup: remove client from shared map */
     let mut map = clients.lock().await;
     map.remove(&id);
     println!("Cleaned up client: {}", id);
@@ -170,27 +184,30 @@ async fn handle_client(
     Ok(())
 }
 
+/* main bootstrap */
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /* bind listener and shared clients map */
     let listener = TcpListener::bind("0.0.0.0:8081").await?;
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
-    //Server attribute setting
+    /* set static server ID (call once) */
     set_id("00000000-0000-0000-0000-000000000000");
 
+    /* generate server X25519 keypair and register as server certificate */
     let (rec_sec_bytes, rec_pub_bytes) = asymmetric::keypairgen();
     let rec_sec = StaticSecret::from(rec_sec_bytes);
     let rec_pub = PublicKey::from(rec_pub_bytes);
     set_cert(rec_pub, rec_sec);
 
-    //welcome message and info
+    /* startup banner with fingerprint */
     println!(
         "© Loop64 / FOG64 | Launching FoggyChat™ FCTP protocol server | SERVER_ID: {} | FINGERPRINT: {}",
         get_id(),
         crypt::utils::blake3_hash(rec_pub.as_bytes())
     );
 
-    //Incoming connection handling
+    /* accept loop: spawn a task per accepted connection */
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
@@ -209,6 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+/* Tests: crypto and UUID smoke-tests */
 
 /*
     TESTS
